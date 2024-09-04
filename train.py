@@ -26,8 +26,9 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.tensorboard import SummaryWriter
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, ThoughtGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -54,6 +55,7 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+thought_offset = 2
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -103,6 +105,8 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=os.path.join(out_dir, 'tensorboard_logs'))
+    
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -154,7 +158,8 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = ThoughtGPT(thought_offset=thought_offset, config=gptconf)
+    # model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -271,6 +276,12 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+
+        writer.add_scalar('Loss/train', losses['train'], iter_num)
+        writer.add_scalar('Loss/val', losses['val'], iter_num)
+        writer.add_scalar('Learning_rate', lr, iter_num)
+        writer.add_scalar('MFU', running_mfu*100, iter_num)
+        
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -325,6 +336,10 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        writer.add_scalar('Loss/train_step', lossf, iter_num)
+        writer.add_scalar('Performance/step_time_ms', dt*1000, iter_num)
+        writer.add_scalar('Performance/mfu', running_mfu*100, iter_num)
+ 
     iter_num += 1
     local_iter_num += 1
 
